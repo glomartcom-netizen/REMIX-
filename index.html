@@ -1,1 +1,274 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
 
+import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+
+interface IERC20 {
+    function transfer(address to, uint256 v) external returns (bool);
+    function transferFrom(address from, address to, uint256 v) external returns (bool);
+    function balanceOf(address a) external view returns (uint256);
+}
+
+interface IPancakePair {
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function token0() external view returns (address);
+}
+
+contract DimeXFinalMaster is Pausable, Ownable, ReentrancyGuard {
+    IERC20 public dmx;
+    IERC20 public usdt = IERC20(0x55d398326f99059fF775485246999027B3197955);
+    IPancakePair public pancakePair;
+    address public usdtReceiver;
+
+    // --- CONFIGURABLES ---  
+    uint256 public MIN_STAKE_DMX = 5000 ether;  
+    uint256 public MIN_STAKE_USDT = 25 ether;  
+    uint256 public MIN_CLAIM_DMX = 100 ether;  
+    uint256 public INCOME_CAP_MULT = 4;  
+    uint256 public RESTAKE_BONUS = 5;  
+    uint256 public totalDirectBonusPercent = 10;  
+      
+    uint256 public dailyRate90BPS = 20;  
+    uint256 public dailyRate180BPS = 25;  
+    uint256 public dailyRate365BPS = 30;  
+
+    bool public isManualPrice = true;  
+    uint256 public manualDMXPriceInUSDT = 10000000000000000; 
+    uint256 public MAINTENANCE_UNIT = 10000 ether;  
+
+    // --- TOTAL STATS (Final List) ---
+    uint256 public totalUSDTStaked;
+    uint256 public totalStakedAllUsers;
+    uint256 public totalClaimedDMX;
+    uint256 public totalDirectPaid;
+    uint256 public totalLevelPaid;
+    uint256 public totalRestakeDMX;
+
+    // --- DATA ---  
+    struct Stake { uint256 amountDMX; uint256 start; uint256 end; uint256 lastClaim; uint256 rewardRateBPS; bool active; }  
+    struct User { address referrer; uint256 totalStakedDMX; uint256 totalEarnedDMX; uint256 directIncomeDMX; uint256 levelIncomeDMX; uint256 directVolumeDMX; uint256 teamVolumeDMX; uint256 levelUnlockExpiry; uint256 customMultiplier; bool isCapped; }  
+    struct ClaimRecord { uint256 amount; uint256 timestamp; }
+
+    mapping(address => User) public users;  
+    mapping(address => Stake[]) public userStakes;  
+    mapping(address => address[]) public directs;  
+    mapping(address => ClaimRecord[]) public userClaims; 
+    address[] public membersList;  
+
+    uint256[25] public levelBps;  
+    mapping(uint256 => uint256) public levelUnlockVolume;  
+
+    // --- EVENTS ---  
+    event StakeLog(address indexed user, uint256 amount, uint256 duration, string asset, uint256 timestamp);  
+    event ClaimLog(address indexed user, uint256 amount, uint256 timestamp);  
+    event RestakeLog(address indexed user, uint256 amount, uint256 timestamp);  
+    event Announcement(string message, string imageUrl);  
+    event RewardPaid(address indexed user, uint256 amount, string reason);  
+
+    constructor(address _dmx, address _pair, address _usdtReceiver) Ownable(msg.sender) {  
+        dmx = IERC20(_dmx); pancakePair = IPancakePair(_pair); usdtReceiver = _usdtReceiver;  
+        uint256[25] memory initialBps = [uint256(3000), 1500, 1000, 700, 500, 400, 300, 200, 200, 200, 100, 100, 100, 100, 100, 50, 50, 50, 50, 50, 25, 25, 25, 25, 25];  
+        for(uint i=0; i<25; i++) { levelBps[i] = initialBps[i]; }  
+    }  
+
+    // --- STAKING CORE ---  
+    function stakeDMX(uint256 _amount, uint256 _duration, address _ref) external whenNotPaused nonReentrant {  
+        require(_amount >= MIN_STAKE_DMX, "Min 5000 DMX");  
+        require(dmx.transferFrom(msg.sender, address(this), _amount), "Transfer failed");  
+        _setupStake(msg.sender, _amount, _duration, _ref, false);  
+        emit StakeLog(msg.sender, _amount, _duration, "DMX", block.timestamp);  
+    }  
+
+    function stakeUSDT(uint256 _usdtAmount, uint256 _duration, address _ref) external whenNotPaused nonReentrant {  
+        require(_usdtAmount >= MIN_STAKE_USDT, "Min 25 USDT");  
+        uint256 dmxAmt = getDMXFromUSDT(_usdtAmount);  
+        require(usdt.transferFrom(msg.sender, usdtReceiver, _usdtAmount), "Transfer failed");  
+        totalUSDTStaked += _usdtAmount; // Added Total USDT Track
+        _setupStake(msg.sender, dmxAmt, _duration, _ref, false);  
+        emit StakeLog(msg.sender, dmxAmt, _duration, "USDT", block.timestamp);  
+    }  
+
+    function _setupStake(address _u, uint256 _dmxAmt, uint256 _dur, address _ref, bool _isR) internal {  
+        require(_dur == 90 days || _dur == 180 days || _dur == 365 days, "Invalid duration");  
+        User storage u = users[_u];  
+        if (u.totalStakedDMX == 0) membersList.push(_u);  // Auto-add Member
+        if (u.referrer == address(0) && _ref != _u && _ref != address(0)) { u.referrer = _ref; directs[_ref].push(_u); }  
+
+        if (u.referrer != address(0) && !_isR) {  
+            users[u.referrer].directVolumeDMX += _dmxAmt;  
+            _updateTV(u.referrer, _dmxAmt);  
+            _payDirectBonus(u.referrer, _dmxAmt);  
+            uint256 add = (_dmxAmt * 30 days) / MAINTENANCE_UNIT;  
+            u.levelUnlockExpiry = (u.levelUnlockExpiry < block.timestamp) ? block.timestamp + add : u.levelUnlockExpiry + add;  
+        }  
+
+        uint256 r = (_dur == 90 days) ? dailyRate90BPS : (_dur == 180 days ? dailyRate180BPS : dailyRate365BPS);  
+        userStakes[_u].push(Stake(_dmxAmt, block.timestamp, block.timestamp + _dur, block.timestamp, r, true));  
+        u.totalStakedDMX += _dmxAmt;  
+        totalStakedAllUsers += _dmxAmt;  
+    }  
+
+    // --- CLAIM & RESTAKE ---
+    function claim() external whenNotPaused nonReentrant {
+        uint256 rDMX = getClaimable(msg.sender);
+        uint256 m = users[msg.sender].customMultiplier > 0 ? users[msg.sender].customMultiplier : INCOME_CAP_MULT;
+        uint256 cap = users[msg.sender].totalStakedDMX * m;
+        require(rDMX >= MIN_CLAIM_DMX && users[msg.sender].totalEarnedDMX < cap, "Claim failed");
+        
+        require(dmx.balanceOf(address(this)) >= rDMX, "Insufficient contract balance");
+
+        if (users[msg.sender].totalEarnedDMX + rDMX >= cap) {
+            rDMX = cap - users[msg.sender].totalEarnedDMX;
+            users[msg.sender].isCapped = true;
+        }
+
+        users[msg.sender].totalEarnedDMX += rDMX;
+        totalClaimedDMX += rDMX; // Track Total Claimed
+        userClaims[msg.sender].push(ClaimRecord(rDMX, block.timestamp)); 
+
+        require(dmx.transfer(msg.sender, rDMX), "Payout failed");
+        _distributeL(msg.sender, rDMX);
+
+        for (uint i=0; i < userStakes[msg.sender].length; i++) {
+            if (userStakes[msg.sender][i].active) {
+                userStakes[msg.sender][i].lastClaim = block.timestamp;
+                if(block.timestamp >= userStakes[msg.sender][i].end) userStakes[msg.sender][i].active = false;
+            }
+        }
+        emit ClaimLog(msg.sender, rDMX, block.timestamp);
+    }
+
+    function restake() external whenNotPaused nonReentrant {
+        uint256 rDMX = getClaimable(msg.sender);
+        uint256 m = users[msg.sender].customMultiplier > 0 ? users[msg.sender].customMultiplier : INCOME_CAP_MULT;
+        uint256 cap = users[msg.sender].totalStakedDMX * m;
+        require(rDMX >= MIN_CLAIM_DMX && users[msg.sender].totalEarnedDMX < cap, "Restake Error");
+
+        if (users[msg.sender].totalEarnedDMX + rDMX >= cap) {
+            rDMX = cap - users[msg.sender].totalEarnedDMX;
+            users[msg.sender].isCapped = true;
+        }
+
+        uint256 bonusAmt = (rDMX * RESTAKE_BONUS) / 100;
+        uint256 totalRestake = rDMX + bonusAmt;
+        totalRestakeDMX += rDMX;
+        users[msg.sender].totalEarnedDMX += rDMX;
+        userClaims[msg.sender].push(ClaimRecord(rDMX, block.timestamp)); 
+
+        for (uint i=0; i < userStakes[msg.sender].length; i++) {
+            if (userStakes[msg.sender][i].active) {
+                userStakes[msg.sender][i].lastClaim = block.timestamp;
+                if(block.timestamp >= userStakes[msg.sender][i].end) userStakes[msg.sender][i].active = false;
+            }
+        }
+        _setupStake(msg.sender, totalRestake, 365 days, users[msg.sender].referrer, true);
+        emit RestakeLog(msg.sender, totalRestake, block.timestamp);
+    }
+
+    // --- REWARD LOGIC ---  
+    function _payDirectBonus(address _ref, uint256 _amt) internal {
+        uint256 dB = (_amt * totalDirectBonusPercent) / 100;
+        uint256 m = users[_ref].customMultiplier > 0 ? users[_ref].customMultiplier : INCOME_CAP_MULT;
+        uint256 cap = users[_ref].totalStakedDMX * m;
+        if (users[_ref].totalEarnedDMX < cap) {
+            dB = (users[_ref].totalEarnedDMX + dB > cap) ? cap - users[_ref].totalEarnedDMX : dB;
+            if(dmx.balanceOf(address(this)) >= dB) {
+                if(dmx.transfer(_ref, dB)) {
+                    users[_ref].directIncomeDMX += dB;
+                    users[_ref].totalEarnedDMX += dB;
+                    totalDirectPaid += dB; // Track Total Direct Paid
+                }
+            }
+        }
+    }
+
+    function _distributeL(address _u, uint256 _r) internal {
+        address up = users[_u].referrer;
+        for (uint i=0; i<25; i++) {
+            if (up == address(0)) break;
+            if(users[up].teamVolumeDMX < levelUnlockVolume[i+1]) { up = users[up].referrer; continue; }
+            uint256 m = users[up].customMultiplier > 0 ? users[up].customMultiplier : INCOME_CAP_MULT;
+            uint256 c = users[up].totalStakedDMX * m;
+            if (users[up].levelUnlockExpiry > block.timestamp && users[up].totalEarnedDMX < c) {
+                uint256 b = (_r * levelBps[i]) / 10000;
+                b = (users[up].totalEarnedDMX + b > c) ? c - users[up].totalEarnedDMX : b;
+                if(dmx.balanceOf(address(this)) >= b) {
+                    if(dmx.transfer(up, b)) {
+                        users[up].levelIncomeDMX += b; users[up].totalEarnedDMX += b;
+                        totalLevelPaid += b; // Track Total Level Paid
+                    }
+                }
+            }
+            up = users[up].referrer;
+        }
+    }
+
+    function _updateTV(address _u, uint256 _a) internal {
+        address up = users[_u].referrer;
+        while (up != address(0)) { users[up].teamVolumeDMX += _a; up = users[up].referrer; }
+    }
+
+    // --- VIEW FUNCTIONS ---  
+    function getStakeHistory(address _u) external view returns (Stake[] memory) { return userStakes[_u]; }
+    function getClaimHistory(address _u) external view returns (ClaimRecord[] memory) { return userClaims[_u]; }
+    function getDirects(address _u) external view returns (address[] memory) { return directs[_u]; }
+    
+    function getDMXFromUSDT(uint256 _usdtAmount) public view returns (uint256) {  
+        if (isManualPrice) return (_usdtAmount * 1e18) / manualDMXPriceInUSDT;  
+        (uint112 r0, uint112 r1,) = pancakePair.getReserves();
+        require(r0 > 0 && r1 > 0, "Pancake: Zero Reserves");
+        return (pancakePair.token0() == address(usdt)) ? (_usdtAmount * r1) / r0 : (_usdtAmount * r0) / r1;  
+    }  
+
+    function getClaimable(address _u) public view returns (uint256 t) {  
+        Stake[] memory sts = userStakes[_u];  
+        uint256 m = users[_u].customMultiplier > 0 ? users[_u].customMultiplier : INCOME_CAP_MULT;  
+        uint256 c = users[_u].totalStakedDMX * m;  
+        for (uint i=0; i<sts.length; i++) {  
+            if (sts[i].active && sts[i].lastClaim < sts[i].end) {  
+                uint256 time = block.timestamp > sts[i].end ? sts[i].end - sts[i].lastClaim : block.timestamp - sts[i].lastClaim;  
+                t += (sts[i].amountDMX * sts[i].rewardRateBPS * time) / (10000 * 1 days);  
+            }  
+        }  
+        if (users[_u].totalEarnedDMX + t > c) t = (c > users[_u].totalEarnedDMX) ? c - users[_u].totalEarnedDMX : 0;  
+    }
+
+    // New Function for Admin Dashboard to see all Pending Rewards
+    function getTotalPendingClaims() external view returns (uint256 totalPending) {
+        for (uint i = 0; i < membersList.length; i++) {
+            totalPending += getClaimable(membersList[i]);
+        }
+    }
+
+    function getFullDashboardStats(address _u) external view returns (uint256 totalStaked, uint256 totalEarned, uint256 directIncome, uint256 levelIncome, uint256 directVol, uint256 teamVol, uint256 unlockExpiry, uint256 claimable, uint256 cap) {
+        User memory u = users[_u];
+        uint256 m = u.customMultiplier > 0 ? u.customMultiplier : INCOME_CAP_MULT;
+        return (u.totalStakedDMX, u.totalEarnedDMX, u.directIncomeDMX, u.levelIncomeDMX, u.directVolumeDMX, u.teamVolumeDMX, u.levelUnlockExpiry, getClaimable(_u), u.totalStakedDMX * m);
+    }
+
+    // --- ADMIN FUNCTIONS ---  
+    function setDailyRewardPercent(uint256 _r90, uint256 _r180, uint256 _r365) external onlyOwner { dailyRate90BPS = _r90; dailyRate180BPS = _r180; dailyRate365BPS = _r365; }
+    function setMinimumClaim(uint256 _amount) external onlyOwner { MIN_CLAIM_DMX = _amount; }
+    function setRestakeBonus(uint256 _p) external onlyOwner { RESTAKE_BONUS = _p; } 
+    function manualReward(address _u, uint256 _a, string memory _r) external onlyOwner { require(dmx.balanceOf(address(this)) >= _a, "Insuff balance"); require(dmx.transfer(_u, _a)); emit RewardPaid(_u, _a, _r); } 
+    function emergencyWithdrawToken(address _tk, address _to, uint256 _v) external onlyOwner { require(IERC20(_tk).transfer(_to, _v)); }
+    function getMembersCount() external view returns (uint256) { return membersList.length; }
+    function postAnnouncement(string memory _m, string memory _img) external onlyOwner { emit Announcement(_m, _img); }
+    function changeTreasury(address _t) external onlyOwner { usdtReceiver = _t; }
+    function giveRankReward(address _u, uint256 _a, string memory _rank) external onlyOwner { require(dmx.balanceOf(address(this)) >= _a, "Insuff balance"); require(dmx.transfer(_u, _a)); emit RewardPaid(_u, _a, _rank); }
+    function unlockLevelManually(address _u, uint256 _days) external onlyOwner { uint256 add = _days * 1 days; users[_u].levelUnlockExpiry = (users[_u].levelUnlockExpiry < block.timestamp) ? block.timestamp + add : users[_u].levelUnlockExpiry + add; }
+    function setDirectPercent(uint256 _p) external onlyOwner { totalDirectBonusPercent = _p; }  
+    function setLevelPercent(uint256 _l, uint256 _p) external onlyOwner { require(_l >= 1 && _l <= 25); levelBps[_l-1] = _p; }  
+    function setLevelUnlockVolume(uint256 _l, uint256 _v) external onlyOwner { require(_l >= 1 && _l <= 25); levelUnlockVolume[_l] = _v; }  
+    function toggleManualPrice(bool _status) external onlyOwner { isManualPrice = _status; }  
+    function setManualPrice(uint256 _p) external onlyOwner { require(_p > 0); manualDMXPriceInUSDT = _p; }  
+    function resetCap(address _u) external onlyOwner { users[_u].totalEarnedDMX = 0; users[_u].isCapped = false; }  
+    function setIncomeCap(uint256 _m) external onlyOwner { INCOME_CAP_MULT = _m; }  
+    function setCustomCap(address _u, uint256 _m) external onlyOwner { users[_u].customMultiplier = _m; }  
+    function pause() external onlyOwner { _pause(); }  
+    function unpause() external onlyOwner { _unpause(); }  
+    function getMembersList() external view returns (address[] memory) { return membersList; }
+}
+          
