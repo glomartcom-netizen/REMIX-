@@ -24,7 +24,7 @@ contract DimeXFinalMaster is Pausable, Ownable, ReentrancyGuard {
 
     // --- CONFIGURABLES ---  
     uint256 public MIN_STAKE_DMX = 5000 ether;  
-    uint256 public MIN_STAKE_USDT = 25 ether;  
+    uint256 public MIN_STAKE_USDT = 25 * 1e6;  
     uint256 public MIN_CLAIM_DMX = 100 ether;  
     uint256 public INCOME_CAP_MULT = 4;  
     uint256 public RESTAKE_BONUS = 5;  
