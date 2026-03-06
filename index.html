@@ -123,13 +123,23 @@ contract DimeXFinalMaster is Pausable, Ownable, ReentrancyGuard {
     }  
 
     // --- CLAIM & RESTAKE ---
-    function claim() external whenNotPaused nonReentrant {
-        uint256 rDMX = getClaimable(msg.sender);
-        uint256 m = users[msg.sender].customMultiplier > 0 ? users[msg.sender].customMultiplier : INCOME_CAP_MULT;
-        uint256 cap = users[msg.sender].totalStakedDMX * m;
-        require(rDMX >= MIN_CLAIM_DMX && users[msg.sender].totalEarnedDMX < cap, "Claim failed");
-        
-        require(dmx.balanceOf(address(this)) >= rDMX, "Insufficient contract balance");
+function claim() external whenNotPaused nonReentrant {
+
+uint256 rDMX = getClaimable(msg.sender);
+
+uint256 m = users[msg.sender].customMultiplier > 0
+ ? users[msg.sender].customMultiplier
+ : INCOME_CAP_MULT;
+
+uint256 cap = users[msg.sender].totalStakedDMX * m;
+
+require(
+ (rDMX >= MIN_CLAIM_DMX || users[msg.sender].totalEarnedDMX + rDMX >= cap)
+ && users[msg.sender].totalEarnedDMX < cap,
+ "Claim failed"
+);
+
+require(dmx.balanceOf(address(this)) >= rDMX, "Insufficient contract balance");
 
         if (users[msg.sender].totalEarnedDMX + rDMX >= cap) {
             rDMX = cap - users[msg.sender].totalEarnedDMX;
