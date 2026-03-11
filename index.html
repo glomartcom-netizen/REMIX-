@@ -23,8 +23,7 @@ contract DimeXFinalMaster is Pausable, Ownable, ReentrancyGuard {
     address public usdtReceiver;
 
     // --- CONFIGURABLES ---  
-    uint256 public MIN_STAKE_DMX = 5000 ether;  
-    uint256 public MIN_STAKE_USDT = 25 * 1e6;  
+    uint256 public MIN_STAKE_DMX = 2500 ether;  
     uint256 public MIN_CLAIM_DMX = 100 ether;  
     uint256 public INCOME_CAP_MULT = 4;  
     uint256 public RESTAKE_BONUS = 5;  
@@ -76,21 +75,32 @@ contract DimeXFinalMaster is Pausable, Ownable, ReentrancyGuard {
         for(uint i=0; i<25; i++) { levelBps[i] = initialBps[i]; }  
     }  
 
-    // --- STAKING CORE ---  
+    // --- STAKING CORE UPDATED ---  
     function stakeDMX(uint256 _amount, uint256 _duration, address _ref) external whenNotPaused nonReentrant {  
-        require(_amount >= MIN_STAKE_DMX, "Min 5000 DMX");  
+        require(_amount >= MIN_STAKE_DMX, "Min 2500 DMX");  
         require(dmx.transferFrom(msg.sender, address(this), _amount), "Transfer failed");  
         _setupStake(msg.sender, _amount, _duration, _ref, false);  
         emit StakeLog(msg.sender, _amount, _duration, "DMX", block.timestamp);  
     }  
 
-    function stakeUSDT(uint256 _usdtAmount, uint256 _duration, address _ref) external whenNotPaused nonReentrant {  
-        require(_usdtAmount >= MIN_STAKE_USDT, "Min 25 USDT");  
-        uint256 dmxAmt = getDMXFromUSDT(_usdtAmount);  
-        require(usdt.transferFrom(msg.sender, usdtReceiver, _usdtAmount), "Transfer failed");  
-        totalUSDTStaked += _usdtAmount; 
-        _setupStake(msg.sender, dmxAmt, _duration, _ref, false);  
-        emit StakeLog(msg.sender, dmxAmt, _duration, "USDT", block.timestamp);  
+    /**
+     * @dev UPDATED: User inputs DMX quantity, contract calculates and pulls USDT
+     */
+    function stakeUSDT(uint256 _dmxAmount, uint256 _duration, address _ref) external whenNotPaused nonReentrant {  
+        require(_dmxAmount >= MIN_STAKE_DMX, "Min 2500 DMX required");  
+        
+        // Calculate exact USDT cost for the DMX amount entered
+        uint256 requiredUSDT = getUSDTFromDMX(_dmxAmount); 
+
+        // Pull the calculated USDT from user wallet to receiver
+        require(usdt.transferFrom(msg.sender, usdtReceiver, requiredUSDT), "USDT Transfer failed");  
+        
+        totalUSDTStaked += requiredUSDT; 
+
+        // Record the stake in DMX units for consistent rewards
+        _setupStake(msg.sender, _dmxAmount, _duration, _ref, false);  
+        
+        emit StakeLog(msg.sender, _dmxAmount, _duration, "USDT", block.timestamp);  
     }  
 
     function _setupStake(address _u, uint256 _dmxAmt, uint256 _dur, address _ref, bool _isR) internal {  
@@ -244,6 +254,16 @@ require(dmx.balanceOf(address(this)) >= rDMX, "Insufficient contract balance");
         return (pancakePair.token0() == address(usdt)) ? (_usdtAmount * r1) / r0 : (_usdtAmount * r0) / r1;  
     }  
 
+    /**
+     * @dev NEW: Calculates required USDT (6 decimals) for a specific DMX target (18 decimals)
+     */
+    function getUSDTFromDMX(uint256 _dmxAmount) public view returns (uint256) {
+        uint256 oneUSDT = 1 * 1e6; 
+        uint256 priceInDmx = getDMXFromUSDT(oneUSDT); 
+        require(priceInDmx > 0, "DimeX: Price Error");
+        return (_dmxAmount * oneUSDT) / priceInDmx;
+    }
+
     function getClaimable(address _u) public view returns (uint256 t) {  
         Stake[] memory sts = userStakes[_u];  
         uint256 m = users[_u].customMultiplier > 0 ? users[_u].customMultiplier : INCOME_CAP_MULT;  
@@ -287,7 +307,8 @@ require(dmx.balanceOf(address(this)) >= rDMX, "Insufficient contract balance");
     function setManualPrice(uint256 _p) external onlyOwner { require(_p > 0); manualDMXPriceInUSDT = _p; }  
     function resetCap(address _u) external onlyOwner { users[_u].totalEarnedDMX = 0; users[_u].isCapped = false; }  
     function setIncomeCap(uint256 _m) external onlyOwner { INCOME_CAP_MULT = _m; }  
-    function setCustomCap(address _u, uint256 _m) external onlyOwner { users[_u].customMultiplier = _m; }  
+    function setCustomCap(address _u, uint256 _m) external onlyOwner { users[_u].customMultiplier = _m; }
+    function setMinStake(uint256 _amount) external onlyOwner { MIN_STAKE_DMX = _amount; }    
     function pause() external onlyOwner { _pause(); }  
     function unpause() external onlyOwner { _unpause(); }  
     function getMembersList() external view returns (address[] memory) { return membersList; }
