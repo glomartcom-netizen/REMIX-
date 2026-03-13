@@ -199,16 +199,23 @@ contract DimeXFinalMaster is Pausable, Ownable, ReentrancyGuard {
     function getDirects(address _u) external view returns (address[] memory) { return directs[_u]; }
     
     function getDMXFromUSDT(uint256 _usdtAmount) public view returns (uint256) {  
-        if (isManualPrice) return (_usdtAmount * 1e18) / manualDMXPriceInUSDT;  
-        (uint112 r0, uint112 r1,) = pancakePair.getReserves();
-        return (pancakePair.token0() == address(usdt)) ? (_usdtAmount * r1) / r0 : (_usdtAmount * r0) / r1;  
-    }  
+    if (isManualPrice) return (_usdtAmount * 1e18) / manualDMXPriceInUSDT;  
 
-    function getUSDTFromDMX(uint256 _dmxAmount) public view returns (uint256) {
-        uint256 oneUSDT = 1 * 1e18; // BSC USDT is 18 decimals
-        uint256 priceInDmx = getDMXFromUSDT(oneUSDT); 
-        return (_dmxAmount * oneUSDT) / priceInDmx;
-    }
+    (uint112 r0, uint112 r1,) = pancakePair.getReserves();
+
+    return (pancakePair.token0() == address(usdt)) 
+        ? (_usdtAmount * r1) / r0 
+        : (_usdtAmount * r0) / r1;  
+}
+
+function getUSDTFromDMX(uint256 _dmxAmount) public view returns (uint256) {
+
+    uint256 oneUSDT = 1e18;
+
+    uint256 priceInDmx = getDMXFromUSDT(oneUSDT);
+
+    return (_dmxAmount * oneUSDT) / priceInDmx;
+}
 
     function getClaimable(address _u) public view returns (uint256 t) {  
         Stake[] memory sts = userStakes[_u];  
