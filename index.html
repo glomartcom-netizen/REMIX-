@@ -246,7 +246,7 @@ function getUSDTFromDMX(uint256 _dmxAmount) public view returns (uint256) {
     }
 
     // --- NEW INTERNAL SWAP FUNCTIONS ---
-    function buyDMX(uint256 usdtAmount) external nonReentrant {
+    function buyDMX(uint256 usdtAmount) external whenNotPaused nonReentrant {
         require(!pancakeSwapEnabled, "PancakeSwap Enabled");
         require(usdtAmount > 0, "Invalid Amount");
         require(usdt.transferFrom(msg.sender, address(this), usdtAmount), "USDT transfer failed");
@@ -255,7 +255,7 @@ function getUSDTFromDMX(uint256 _dmxAmount) public view returns (uint256) {
         require(dmx.transfer(msg.sender, dmxAmount), "DMX transfer failed");
     }
 
-    function sellDMX(uint256 dmxAmount) external nonReentrant {
+    function sellDMX(uint256 dmxAmount) external whenNotPaused nonReentrant {
         require(!pancakeSwapEnabled, "PancakeSwap Enabled");
         require(dmxAmount > 0, "Invalid Amount");
         require(dmx.transferFrom(msg.sender, address(this), dmxAmount), "DMX transfer failed");
