@@ -199,13 +199,18 @@ contract DimeXFinalMaster is Pausable, Ownable, ReentrancyGuard {
     function getDirects(address _u) external view returns (address[] memory) { return directs[_u]; }
     
     function getDMXFromUSDT(uint256 _usdtAmount) public view returns (uint256) {  
-    if (isManualPrice) return (_usdtAmount * 1e18) / manualDMXPriceInUSDT;  
+
+    if (isManualPrice) {
+        return (_usdtAmount * 1e18) / manualDMXPriceInUSDT;
+    }
 
     (uint112 r0, uint112 r1,) = pancakePair.getReserves();
 
+    require(r0 > 1000 ether && r1 > 1000 ether, "Low liquidity");
+
     return (pancakePair.token0() == address(usdt)) 
         ? (_usdtAmount * r1) / r0 
-        : (_usdtAmount * r0) / r1;  
+        : (_usdtAmount * r0) / r1;
 }
 
 function getUSDTFromDMX(uint256 _dmxAmount) public view returns (uint256) {
