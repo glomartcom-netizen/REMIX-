@@ -186,46 +186,50 @@ contract DimeXFinalMaster is Pausable, Ownable, ReentrancyGuard {
 
     for (uint i = 0; i < 25; i++) {
         if (up == address(0)) break;
-
         up = _processLevel(up, _amount, i);
     }
 }
 
 function _processLevel(address up, uint256 _amount, uint i) internal returns (address) {
+    User storage u = users[up];
 
-    if (users[up].levelUnlockExpiry < block.timestamp || users[up].isCapped) {
-        return users[up].referrer;
+    // basic checks
+    if (u.levelUnlockExpiry < block.timestamp || u.isCapped) {
+        return u.referrer;
     }
 
-    if (unlockMode == 1 && levelDirectRequired[i+1] > 0 && directs[up].length < levelDirectRequired[i+1]) {
-        return users[up].referrer;
-    }
-
-    if (unlockMode == 2 && levelUnlockVolume[i+1] > 0 && users[up].teamVolumeDMX < levelUnlockVolume[i+1]) {
-        return users[up].referrer;
+    // unlock conditions
+    if (unlockMode == 1) {
+        if (levelDirectRequired[i+1] > 0 && directs[up].length < levelDirectRequired[i+1]) {
+            return u.referrer;
+        }
+    } else if (unlockMode == 2) {
+        if (levelUnlockVolume[i+1] > 0 && u.teamVolumeDMX < levelUnlockVolume[i+1]) {
+            return u.referrer;
+        }
     }
 
     uint256 remaining = getRemainingCap(up);
     if (remaining == 0) {
-        users[up].isCapped = true;
-        return users[up].referrer;
+        u.isCapped = true;
+        return u.referrer;
     }
 
     uint256 b = (_amount * levelBps[i]) / 10000;
 
     if (b > remaining) {
         b = remaining;
-        users[up].isCapped = true;
+        u.isCapped = true;
     }
 
-    if (b > 0) {
-        users[up].levelIncomeDMX += b;
-        users[up].claimableDMX += b;
+    if (b != 0) {
+        u.levelIncomeDMX += b;
+        u.claimableDMX += b;
         levelIncomeBreakup[up][i] += b;
         totalLevelPaid += b;
     }
 
-    return users[up].referrer;
+    return u.referrer;
 }
 
     function stakeDMX(uint256 _amount, uint256 _duration, address _ref) external whenNotPaused nonReentrant {
@@ -245,48 +249,51 @@ function _processLevel(address up, uint256 _amount, uint i) internal returns (ad
     }
 
     function _setupStake(address _u, uint256 _amt, uint256 _dur, address _ref, bool _isR) internal {
-        require(_dur == 7776000 || _dur == 15552000 || _dur == 31536000, "Invalid duration");
-        User storage u = users[_u];
-        
-        if (!isMember[_u]) { membersList.push(_u); isMember[_u] = true; }
-        if (u.referrer == address(0) && _ref != _u && _ref != address(0)) { 
-            u.referrer = _ref; 
-            directs[_ref].push(_u); 
-        }
-        
-        if (u.referrer != address(0) && !_isR) {
-            users[u.referrer].directVolumeDMX += _amt;
-            directBusiness[u.referrer][_u] += _amt; 
-            _updateTV(u.referrer, _amt);
+    require(_dur == 7776000 || _dur == 15552000 || _dur == 31536000, "Invalid duration");
 
-            address up = u.referrer;
-for (uint i = 0; i < teamBonusLevels; i++) {
-    if (up == address(0)) break;
-    up = processTeamBonus(up, _amt);
-}
-            
-            uint256 remCapDirect = getRemainingCap(u.referrer);
-            if (remCapDirect > 0) {
-                uint256 dB = (_amt * totalDirectBonusPercent) / 100;
-                if (dB > remCapDirect) { dB = remCapDirect; users[u.referrer].isCapped = true; }
-                users[u.referrer].directIncomeDMX += dB;
-                users[u.referrer].claimableDMX += dB;
-                totalDirectPaid += dB;
-            }
+    User storage u = users[_u];
 
-            uint256 oldMonths = (users[u.referrer].directVolumeDMX - _amt) / MAINTENANCE_UNIT;
-            uint256 newMonths = users[u.referrer].directVolumeDMX / MAINTENANCE_UNIT;
-            if (newMonths > oldMonths) {
-                uint256 addSecs = (newMonths - oldMonths) * 30 days;
-                users[u.referrer].levelUnlockExpiry = (users[u.referrer].levelUnlockExpiry < block.timestamp) ? block.timestamp + addSecs : users[u.referrer].levelUnlockExpiry + addSecs;
-            }
-        }
-        
-        uint256 r = (_dur == 7776000) ? dailyRate90BPS : (_dur == 15552000 ? dailyRate180BPS : dailyRate365BPS);
-        userStakes[_u].push(Stake(_amt, block.timestamp, block.timestamp + _dur, block.timestamp, r, true));
-        u.totalStakedDMX += _amt;
-        totalStakedAllUsers += _amt;
+    // member add
+    if (!isMember[_u]) {
+        membersList.push(_u);
+        isMember[_u] = true;
     }
+
+    // set referrer
+    if (u.referrer == address(0) && _ref != _u && _ref != address(0)) {
+        u.referrer = _ref;
+        directs[_ref].push(_u);
+    }
+
+    address ref = u.referrer;
+
+    // referral logic
+    if (ref != address(0) && !_isR) {
+
+        User storage rUser = users[ref];
+
+        rUser.directVolumeDMX += _amt;
+        directBusiness[ref][_u] += _amt;
+
+        _updateTV(ref, _amt);
+
+        _distributeTeamBonus(ref, _amt);
+
+        _applyDirectBonus(ref, _amt);
+
+        _updateLevelExpiry(ref, _amt);
+    }
+
+    // stake creation
+    uint256 r = _getRate(_dur);
+
+    userStakes[_u].push(
+        Stake(_amt, block.timestamp, block.timestamp + _dur, block.timestamp, r, true)
+    );
+
+    u.totalStakedDMX += _amt;
+    totalStakedAllUsers += _amt;
+}
 
     function claim() public whenNotPaused nonReentrant {
         _updateUserStakes(msg.sender);
@@ -397,7 +404,59 @@ for (uint i = 0; i < teamBonusLevels; i++) {
     }
 
     return users[up].referrer;
-}         
+}    
+
+  function _distributeTeamBonus(address ref, uint256 _amt) internal {
+    address up = ref;
+
+    for (uint i = 0; i < teamBonusLevels; i++) {
+        if (up == address(0)) break;
+        up = processTeamBonus(up, _amt);
+    }
+}
+
+  function _applyDirectBonus(address ref, uint256 _amt) internal {
+    uint256 remaining = getRemainingCap(ref);
+    if (remaining == 0) return;
+
+    uint256 bonus = (_amt * totalDirectBonusPercent) / 100;
+
+    if (bonus > remaining) {
+        bonus = remaining;
+        users[ref].isCapped = true;
+    }
+
+    if (bonus != 0) {
+        users[ref].directIncomeDMX += bonus;
+        users[ref].claimableDMX += bonus;
+        totalDirectPaid += bonus;
+    }
+}      
+
+function _updateLevelExpiry(address ref, uint256 _amt) internal {
+    User storage u = users[ref];
+
+    uint256 oldMonths = (u.directVolumeDMX - _amt) / MAINTENANCE_UNIT;
+    uint256 newMonths = u.directVolumeDMX / MAINTENANCE_UNIT;
+
+    if (newMonths > oldMonths) {
+        uint256 addSecs = (newMonths - oldMonths) * 30 days;
+
+        if (u.levelUnlockExpiry < block.timestamp) {
+            u.levelUnlockExpiry = block.timestamp + addSecs;
+        } else {
+            u.levelUnlockExpiry += addSecs;
+        }
+    }
+}        
+
+ function _getRate(uint256 _dur) internal view returns (uint256) {
+    if (_dur == 7776000) return dailyRate90BPS;      // 90 days
+    if (_dur == 15552000) return dailyRate180BPS;    // 180 days
+    if (_dur == 31536000) return dailyRate365BPS;    // 365 days
+
+    revert("Invalid duration");
+}                                   
 
     // --- VIEW FUNCTIONS (Split to fix Stack Too Deep) ---
     function getDashboard1(address _u) external view returns(
