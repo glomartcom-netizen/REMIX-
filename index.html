@@ -1,1 +1,482 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+
+interface IERC20 {
+    function transfer(address to, uint256 v) external returns (bool);
+    function transferFrom(address from, address to, uint256 v) external returns (bool);
+    function balanceOf(address a) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+}
+
+interface IPancakePair {
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function token0() external view returns (address);
+}
+
+interface IPancakeRouter02 {
+    function swapExactTokensForTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external returns (uint[] memory amounts);
+}
+
+contract DimeXFinalMaster is Pausable, Ownable, ReentrancyGuard {
+    IERC20 public dmx;
+    IERC20 public usdt = IERC20(0x55d398326f99059fF775485246999027B3197955);
+    IPancakePair public pancakePair;
+    address public usdtReceiver;
+
+    // --- CONFIGURABLES ---
+    uint256 public MIN_STAKE_DMX = 2500 ether;
+    uint256 public MIN_CLAIM_DMX = 100 ether;
+    uint256 public INCOME_CAP_MULT = 4;
+    uint256 public RESTAKE_BONUS = 5;
+    uint256 public totalDirectBonusPercent = 10;
+    uint256 public dailyRate90BPS = 20;
+    uint256 public dailyRate180BPS = 25;
+    uint256 public dailyRate365BPS = 30;
+    bool public isManualPrice = true;
+    uint256 public manualDMXPriceInUSDT = 10000000000000000;
+    bool public pancakeSwapEnabled = false;
+    uint256 public MAINTENANCE_UNIT = 10000 ether;
+    uint256 public slippagePercent = 95;
+    uint256 public maxEmergencyWithdraw = 100000 ether;
+    bool public autoSwapEnabled = false;
+    IPancakeRouter02 public router;
+
+    // --- TEAM BONUS CONFIG ---
+    uint256 public teamBonusPercent = 200; // 2%
+    uint256 public teamBonusLevels = 5;
+
+    struct Stake {
+        uint256 amountDMX;
+        uint256 start;
+        uint256 end;
+        uint256 lastClaim;
+        uint256 rewardRateBPS;
+        bool active;
+    }
+
+    struct User {
+        address referrer;
+        uint256 totalStakedDMX;
+        uint256 totalEarnedDMX;
+        uint256 directIncomeDMX;
+        uint256 levelIncomeDMX;
+        uint256 roiIncomeDMX;
+        uint256 teamIncomeDMX;
+        uint256 claimableDMX;
+        uint256 teamPendingDMX;
+        uint256 directVolumeDMX;
+        uint256 teamVolumeDMX;
+        uint256 levelUnlockExpiry;
+        uint256 lastTeamMove;
+        uint256 customMultiplier;
+        bool isCapped;
+    }
+
+    struct ClaimRecord {
+        uint256 amount;
+        uint256 timestamp;
+    }
+
+    mapping(address => User) public users;
+    mapping(address => Stake[]) public userStakes;
+    mapping(address => address[]) public directs;
+    mapping(address => mapping(address => uint256)) public directBusiness;
+    mapping(address => ClaimRecord[]) public userClaims;
+    mapping(address => uint256[25]) public levelIncomeBreakup; 
+    mapping(address => mapping(uint256 => uint256)) public withdrawTime;
+    
+    address[] public membersList;
+    mapping(address => bool) public isMember;
+    uint256[25] public levelBps;
+    mapping(uint256 => uint256) public levelUnlockVolume;
+    uint8 public unlockMode;
+    mapping(uint256 => uint256) public levelDirectRequired;
+
+    uint256 public totalUSDTStaked;
+    uint256 public totalStakedAllUsers;
+    uint256 public totalClaimedDMX;
+    uint256 public totalDirectPaid;
+    uint256 public totalLevelPaid;
+    uint256 public totalRestakeDMX;
+    uint256 public totalClaimedUSDT;
+
+    event StakeLog(address indexed user, uint256 amount, uint256 duration, string asset, uint256 timestamp);
+    event ClaimLog(address indexed user, uint256 amount, uint256 timestamp);
+    event RestakeLog(address indexed user, uint256 amount, uint256 timestamp);
+    event Announcement(string message, string imageUrl);
+    event RewardPaid(address indexed user, uint256 amount, string reason);
+    event ClaimUSDTLog(address indexed user, uint256 dmxAmount, uint256 usdtAmount, uint256 timestamp);
+    event AutoSwapUsed(address indexed user, uint256 dmxAmount, uint256 usdtAmount);
+    event WithdrawPrincipal(address indexed user, uint256 amount, uint256 index);
+
+    constructor(address _dmx, address _pair, address _usdtReceiver) Ownable(msg.sender) {
+        require(_dmx != address(0) && _pair != address(0) && _usdtReceiver != address(0), "Zero address");
+        dmx = IERC20(_dmx);
+        pancakePair = IPancakePair(_pair);
+        usdtReceiver = _usdtReceiver;
+        uint256[25] memory initialBps = [uint256(3000), 1500, 1000, 700, 500, 400, 300, 200, 200, 200, 100, 100, 100, 100, 100, 50, 50, 50, 50, 50, 25, 25, 25, 25, 25];
+        for(uint i=0; i<25; i++) {
+            levelBps[i] = initialBps[i];
+        }
+        router = IPancakeRouter02(0x10ED43C718714eb63d5aA57B78B54704E256024E);
+        dmx.approve(address(router), type(uint256).max);
+        usdt.approve(address(router), type(uint256).max);
+    }
+
+    // --- CAP LOGIC ---
+    function getRemainingCap(address _u) public view returns (uint256) {
+        uint256 m = users[_u].customMultiplier > 0 ? users[_u].customMultiplier : INCOME_CAP_MULT;
+        uint256 cap = users[_u].totalStakedDMX * m;
+        uint256 used = users[_u].totalEarnedDMX + users[_u].claimableDMX + users[_u].teamPendingDMX;
+        if (used >= cap) return 0;
+        return cap - used;
+    }
+
+    // --- MONDAY TEAM PAYOUT ---
+    function _moveTeamToClaimable(address user) internal {
+        uint256 day = ((block.timestamp / 86400) + 4) % 7; 
+        if(day != 1) return; 
+        if(block.timestamp < users[user].lastTeamMove + 7 days) return; 
+
+        uint256 amt = users[user].teamPendingDMX;
+        if(amt > 0){
+            users[user].claimableDMX += amt;
+            users[user].teamPendingDMX = 0;
+            users[user].lastTeamMove = block.timestamp;
+        }
+    }
+
+    function _updateUserStakes(address _u) internal {
+        for (uint i=0; i < userStakes[_u].length; i++) {
+            if (userStakes[_u][i].active) {
+                uint256 time = block.timestamp > userStakes[_u][i].end
+                    ? userStakes[_u][i].end - userStakes[_u][i].lastClaim
+                    : block.timestamp - userStakes[_u][i].lastClaim;
+
+                if (time > 0) {
+                    uint256 roi = (userStakes[_u][i].amountDMX * userStakes[_u][i].rewardRateBPS * time) / (10000 * 1 days);
+                    
+                    uint256 remaining = getRemainingCap(_u);
+                    if (remaining > 0) {
+                        if (roi > remaining) roi = remaining;
+                        users[_u].roiIncomeDMX += roi;
+                        users[_u].claimableDMX += roi;
+                        _distributeLevelAuto(_u, roi);
+                    }
+                    userStakes[_u][i].lastClaim += time;
+                }
+                if(block.timestamp >= userStakes[_u][i].end) userStakes[_u][i].active = false;
+            }
+        }
+        _moveTeamToClaimable(_u);
+    }
+
+    function _distributeLevelAuto(address _user, uint256 _amount) internal {
+        address up = users[_user].referrer;
+        for (uint i = 0; i < 25; i++) {
+            if (up == address(0)) break;
+            if (users[up].levelUnlockExpiry < block.timestamp || users[up].isCapped) {
+                up = users[up].referrer; continue; 
+            }
+            if (unlockMode == 1 && levelDirectRequired[i+1] > 0 && directs[up].length < levelDirectRequired[i+1]) {
+                up = users[up].referrer; continue;
+            } else if (unlockMode == 2 && levelUnlockVolume[i+1] > 0 && users[up].teamVolumeDMX < levelUnlockVolume[i+1]) {
+                up = users[up].referrer; continue;
+            }
+            uint256 remaining = getRemainingCap(up);
+            if (remaining == 0) { users[up].isCapped = true; up = users[up].referrer; continue; }
+
+            uint256 b = (_amount * levelBps[i]) / 10000;
+            if (b > remaining) { b = remaining; users[up].isCapped = true; }
+            if (b > 0) {
+                users[up].levelIncomeDMX += b;
+                users[up].claimableDMX += b;
+                levelIncomeBreakup[up][i] += b;
+                totalLevelPaid += b;
+            }
+            up = users[up].referrer;
+        }
+    }
+
+    function stakeDMX(uint256 _amount, uint256 _duration, address _ref) external whenNotPaused nonReentrant {
+        require(_amount >= MIN_STAKE_DMX, "Below Min");
+        require(dmx.transferFrom(msg.sender, address(this), _amount), "DMX transfer failed");
+        _setupStake(msg.sender, _amount, _duration, _ref, false);
+        emit StakeLog(msg.sender, _amount, _duration, "DMX", block.timestamp);
+    }
+
+    function stakeUSDT(uint256 _dmxAmount, uint256 _duration, address _ref) external whenNotPaused nonReentrant {
+        require(_dmxAmount >= MIN_STAKE_DMX, "Below Min");
+        uint256 req = getUSDTFromDMX(_dmxAmount);
+        require(usdt.transferFrom(msg.sender, usdtReceiver, req), "USDT transfer failed");
+        totalUSDTStaked += req;
+        _setupStake(msg.sender, _dmxAmount, _duration, _ref, false);
+        emit StakeLog(msg.sender, _dmxAmount, _duration, "USDT", block.timestamp);
+    }
+
+    function _setupStake(address _u, uint256 _amt, uint256 _dur, address _ref, bool _isR) internal {
+        require(_dur == 7776000 || _dur == 15552000 || _dur == 31536000, "Invalid duration");
+        User storage u = users[_u];
+        
+        if (!isMember[_u]) { membersList.push(_u); isMember[_u] = true; }
+        if (u.referrer == address(0) && _ref != _u && _ref != address(0)) { 
+            u.referrer = _ref; 
+            directs[_ref].push(_u); 
+        }
+        
+        if (u.referrer != address(0) && !_isR) {
+            users[u.referrer].directVolumeDMX += _amt;
+            directBusiness[u.referrer][_u] += _amt; 
+            _updateTV(u.referrer, _amt);
+
+            address up = u.referrer;
+            for (uint i = 0; i < teamBonusLevels; i++) {
+                if (up == address(0)) break;
+                if (users[up].levelUnlockExpiry < block.timestamp || users[up].isCapped) {
+                    up = users[up].referrer; continue;
+                }
+                uint256 remaining = getRemainingCap(up);
+                if (remaining == 0) { users[up].isCapped = true; up = users[up].referrer; continue; }
+
+                uint256 bonus = (_amt * teamBonusPercent) / 10000;
+                if (bonus > remaining) { bonus = remaining; users[up].isCapped = true; }
+                if (bonus > 0) {
+                    users[up].teamIncomeDMX += bonus;
+                    users[up].teamPendingDMX += bonus;
+                }
+                up = users[up].referrer;
+            }
+            
+            uint256 remCapDirect = getRemainingCap(u.referrer);
+            if (remCapDirect > 0) {
+                uint256 dB = (_amt * totalDirectBonusPercent) / 100;
+                if (dB > remCapDirect) { dB = remCapDirect; users[u.referrer].isCapped = true; }
+                users[u.referrer].directIncomeDMX += dB;
+                users[u.referrer].claimableDMX += dB;
+                totalDirectPaid += dB;
+            }
+
+            uint256 oldMonths = (users[u.referrer].directVolumeDMX - _amt) / MAINTENANCE_UNIT;
+            uint256 newMonths = users[u.referrer].directVolumeDMX / MAINTENANCE_UNIT;
+            if (newMonths > oldMonths) {
+                uint256 addSecs = (newMonths - oldMonths) * 30 days;
+                users[u.referrer].levelUnlockExpiry = (users[u.referrer].levelUnlockExpiry < block.timestamp) ? block.timestamp + addSecs : users[u.referrer].levelUnlockExpiry + addSecs;
+            }
+        }
+        
+        uint256 r = (_dur == 7776000) ? dailyRate90BPS : (_dur == 15552000 ? dailyRate180BPS : dailyRate365BPS);
+        userStakes[_u].push(Stake(_amt, block.timestamp, block.timestamp + _dur, block.timestamp, r, true));
+        u.totalStakedDMX += _amt;
+        totalStakedAllUsers += _amt;
+    }
+
+    function claim() public whenNotPaused nonReentrant {
+        _updateUserStakes(msg.sender);
+        _moveTeamToClaimable(msg.sender); 
+
+        uint256 total = users[msg.sender].claimableDMX;
+        uint256 remaining = getRemainingCap(msg.sender);
+        if (total > remaining) total = remaining;
+        
+        require(total >= MIN_CLAIM_DMX || remaining == 0, "Below Min");
+        require(total > 0, "No claimable");
+        require(dmx.balanceOf(address(this)) >= total, "Low DMX");
+
+        users[msg.sender].totalEarnedDMX += total;
+        uint256 m = users[msg.sender].customMultiplier > 0 ? users[msg.sender].customMultiplier : INCOME_CAP_MULT;
+        if (users[msg.sender].totalEarnedDMX >= users[msg.sender].totalStakedDMX * m) users[msg.sender].isCapped = true;
+
+        users[msg.sender].claimableDMX = 0;
+        totalClaimedDMX += total;
+        userClaims[msg.sender].push(ClaimRecord(total, block.timestamp));
+        require(dmx.transfer(msg.sender, total), "Fail");
+        emit ClaimLog(msg.sender, total, block.timestamp);
+    }
+
+    function claimUSDT() external whenNotPaused nonReentrant {
+        _updateUserStakes(msg.sender);
+        _moveTeamToClaimable(msg.sender); 
+
+        uint256 total = users[msg.sender].claimableDMX;
+        uint256 remaining = getRemainingCap(msg.sender);
+        if (total > remaining) total = remaining;
+        
+        require(total >= MIN_CLAIM_DMX || remaining == 0, "Below Min");
+        require(total > 0, "No claimable");
+
+        uint256 usdtAmount = getUSDTFromDMX(total);
+        require(usdt.balanceOf(address(this)) >= usdtAmount, "Low Reserve");
+
+        users[msg.sender].totalEarnedDMX += total;
+        uint256 m = users[msg.sender].customMultiplier > 0 ? users[msg.sender].customMultiplier : INCOME_CAP_MULT;
+        if (users[msg.sender].totalEarnedDMX >= users[msg.sender].totalStakedDMX * m) users[msg.sender].isCapped = true;
+
+        users[msg.sender].claimableDMX = 0;
+        totalClaimedDMX += total;
+        userClaims[msg.sender].push(ClaimRecord(total, block.timestamp));
+
+        require(usdt.transfer(msg.sender, usdtAmount), "Fail USDT");
+        totalClaimedUSDT += usdtAmount;
+        emit ClaimUSDTLog(msg.sender, total, usdtAmount, block.timestamp);
+    }
+
+    function restake() external whenNotPaused nonReentrant {
+        _updateUserStakes(msg.sender);
+        _moveTeamToClaimable(msg.sender);
+        
+        uint256 total = users[msg.sender].claimableDMX;
+        uint256 remaining = getRemainingCap(msg.sender);
+        if (total > remaining) total = remaining;
+        require(total >= MIN_CLAIM_DMX || remaining == 0, "Restake Err");
+
+        uint256 totalRestake = total + (total * RESTAKE_BONUS / 100);
+        users[msg.sender].totalEarnedDMX += total;
+        uint256 m = users[msg.sender].customMultiplier > 0 ? users[msg.sender].customMultiplier : INCOME_CAP_MULT;
+        if (users[msg.sender].totalEarnedDMX >= users[msg.sender].totalStakedDMX * m) users[msg.sender].isCapped = true;
+
+        users[msg.sender].claimableDMX = 0;
+        totalRestakeDMX += total;
+        _setupStake(msg.sender, totalRestake, 31536000, users[msg.sender].referrer, true);
+        emit RestakeLog(msg.sender, totalRestake, block.timestamp);
+    }
+
+    function withdrawPrincipal(uint256 index) external nonReentrant {
+        require(index < userStakes[msg.sender].length, "Invalid index");
+        Stake storage s = userStakes[msg.sender][index];
+        require(s.active == true, "Already inactive");
+        require(block.timestamp >= s.end, "Stake still active");
+        require(s.amountDMX > 0, "Already withdrawn");
+        uint256 amount = s.amountDMX;
+        s.amountDMX = 0;
+        s.active = false;
+        withdrawTime[msg.sender][index] = block.timestamp;
+        require(dmx.transfer(msg.sender, amount), "Transfer failed");
+        emit WithdrawPrincipal(msg.sender, amount, index);
+    }
+
+    // --- VIEW FUNCTIONS (Split to fix Stack Too Deep) ---
+    function getDashboard1(address _u) external view returns(
+        uint256 totalStaked, uint256 totalEarned, uint256 directIncome,
+        uint256 levelIncome, uint256 roiIncome, uint256 teamIncome
+    ){
+        User storage u = users[_u];
+        totalStaked = u.totalStakedDMX;
+        totalEarned = u.totalEarnedDMX;
+        directIncome = u.directIncomeDMX;
+        levelIncome = u.levelIncomeDMX;
+        roiIncome = u.roiIncomeDMX + getLiveROI(_u);
+        teamIncome = u.teamIncomeDMX;
+    }
+
+    function getDashboard2(address _u) external view returns(
+        uint256 teamPending, uint256 directVolume, uint256 teamVolume,
+        uint256 levelExpiry, uint256 claimable, uint256 cap, bool cappedStatus
+    ){
+        User storage u = users[_u];
+        teamPending = u.teamPendingDMX;
+        directVolume = u.directVolumeDMX;
+        teamVolume = u.teamVolumeDMX;
+        levelExpiry = u.levelUnlockExpiry;
+        claimable = u.claimableDMX;
+        uint256 m = u.customMultiplier > 0 ? u.customMultiplier : INCOME_CAP_MULT;
+        cap = u.totalStakedDMX * m;
+        cappedStatus = u.isCapped;
+    }
+
+    function getLevelBreakdown(address _u) external view returns (uint256[25] memory) { return levelIncomeBreakup[_u]; }
+
+    function _updateTV(address _u, uint256 _a) internal {
+        address up = users[_u].referrer; 
+        for (uint i = 0; i < 25 && up != address(0); i++) { 
+            users[up].teamVolumeDMX += _a; 
+            up = users[up].referrer; 
+        }
+    }
+
+    function getDMXFromUSDT(uint256 _usdt) public view returns (uint256) {
+        if (isManualPrice) return (_usdt * 1e18) / manualDMXPriceInUSDT;
+        (uint112 r0, uint112 r1,) = pancakePair.getReserves();
+        return (pancakePair.token0() == address(usdt)) ? (_usdt * r1) / r0 : (_usdt * r0) / r1;
+    }
+
+    function getUSDTFromDMX(uint256 _dmx) public view returns (uint256) {
+        uint256 dmxPrice = getDMXFromUSDT(1e18);
+        if(dmxPrice == 0) return 0;
+        return (_dmx * 1e18) / dmxPrice;
+    }
+
+    function getLiveROI(address _u) public view returns (uint256 totalROI) {
+        Stake[] storage stakes = userStakes[_u];
+        for (uint i = 0; i < stakes.length; i++) {
+            if (stakes[i].active) {
+                uint256 time = block.timestamp > stakes[i].end
+                    ? stakes[i].end - stakes[i].lastClaim
+                    : block.timestamp - stakes[i].lastClaim;
+                if (time > 0) {
+                    totalROI += (stakes[i].amountDMX * stakes[i].rewardRateBPS * time) / (10000 * 1 days);
+                }
+            }
+        }
+        return totalROI;
+    }
+
+    // --- ADMIN FUNCTIONS ---
+    function setTeamBonusPercent(uint256 _p) external onlyOwner { require(_p <= 1000); teamBonusPercent = _p; } 
+    function setTeamBonusLevels(uint256 _l) external onlyOwner { require(_l > 0 && _l <= 25); teamBonusLevels = _l; } 
+    function setMinStake(uint256 _a) external onlyOwner { MIN_STAKE_DMX = _a * 1 ether; }
+    function setMinClaim(uint256 _a) external onlyOwner { MIN_CLAIM_DMX = _a * 1 ether; }
+    function setLevelUnlockVolume(uint256 _l, uint256 _v) external onlyOwner { require(_l >= 1 && _l <= 25); levelUnlockVolume[_l] = _v * 1 ether; }
+    function manualReward(address _u, uint256 _a, string memory _r) external onlyOwner { uint256 amt = _a * 1 ether; require(dmx.transfer(_u, amt)); emit RewardPaid(_u, amt, _r); }
+    function giveRankReward(address _u, uint256 _a, string memory _rank) external onlyOwner { uint256 amt = _a * 1 ether; require(dmx.transfer(_u, amt)); emit RewardPaid(_u, amt, _rank); }
+    function setDailyRate(uint256 _r90, uint256 _r180, uint256 _r365) external onlyOwner { dailyRate90BPS = _r90; dailyRate180BPS = _r180; dailyRate365BPS = _r365; }
+    function setRestakeBonus(uint256 _p) external onlyOwner { RESTAKE_BONUS = _p; }
+    function changeTreasury(address _t) external onlyOwner { require(_t != address(0)); usdtReceiver = _t; }
+    function setDirectPercent(uint256 _p) external onlyOwner { totalDirectBonusPercent = _p; }
+    function setLevelPercent(uint256 _l, uint256 _p) external onlyOwner { require(_l >= 1 && _l <= 25); levelBps[_l-1] = _p; }
+    function setIncomeCap(uint256 _m) external onlyOwner { INCOME_CAP_MULT = _m; }
+    function setCustomCap(address _u, uint256 _m) external onlyOwner { users[_u].customMultiplier = _m; }
+    function setManualPrice(uint256 _p) external onlyOwner { manualDMXPriceInUSDT = _p; }
+    function toggleManualPrice(bool _s) external onlyOwner { isManualPrice = _s; }
+    function resetCap(address _u) external onlyOwner { users[_u].totalEarnedDMX = 0; users[_u].isCapped = false; }
+    function unlockLevelManually(address _u, uint256 _d) external onlyOwner { uint256 add = _d * 1 days; users[_u].levelUnlockExpiry = (users[_u].levelUnlockExpiry < block.timestamp) ? block.timestamp + add : users[_u].levelUnlockExpiry + add; }
+    function emergencyWithdrawToken(address _tk, address _to, uint256 _v) external onlyOwner { require(_to != address(0)); require(_v <= maxEmergencyWithdraw); IERC20(_tk).transfer(_to, _v); }
+    function postAnnouncement(string memory _m, string memory _img) external onlyOwner { emit Announcement(_m, _img); }
+    function togglePancakeSwap(bool _s) external onlyOwner { pancakeSwapEnabled = _s; }
+    function pause() external onlyOwner { _pause(); }
+    function unpause() external onlyOwner { _unpause(); }
+    function rescueETH(uint256 amount) external onlyOwner { payable(owner()).transfer(amount); }
+    function setMaintenanceUnit(uint256 _unit) external onlyOwner { MAINTENANCE_UNIT = _unit * 1 ether; }
+    function toggleAutoSwap(bool _s) external onlyOwner { autoSwapEnabled = _s; }
+    function setUnlockMode(uint8 _mode) external onlyOwner { require(_mode <= 2); unlockMode = _mode; }
+    function setLevelDirectRequired(uint256 _level, uint256 _count) external onlyOwner { require(_level >= 1 && _level <= 25); levelDirectRequired[_level] = _count; }
+    function setSlippage(uint256 _p) external onlyOwner { require(_p >= 1 && _p <= 100); slippagePercent = _p; }
+    function setRouter(address _r) external onlyOwner { require(_r != address(0)); router = IPancakeRouter02(_r); dmx.approve(_r, type(uint256).max); usdt.approve(_r, type(uint256).max); }
+    function setPair(address _p) external onlyOwner { require(_p != address(0)); pancakePair = IPancakePair(_p); }
+    function setUSDTReceiver(address _n) external onlyOwner { require(_n != address(0)); usdtReceiver = _n; }
+    function setEmergencyLimit(uint256 _l) external onlyOwner { maxEmergencyWithdraw = _l; }
+
+    function getStakeHistory(address _u) external view returns (Stake[] memory) { return userStakes[_u]; }
+    function getClaimHistory(address _u) external view returns (ClaimRecord[] memory) { return userClaims[_u]; }
+    function getDirects(address _u) external view returns (address[] memory) { return directs[_u]; }
+    function getMembersCount() external view returns (uint256) { return membersList.length; }
+    function getMembersList() public view returns (address[] memory) { return membersList; }
+    function getDirectBusiness(address _u) external view returns (address[] memory, uint256[] memory) {
+        address[] memory refs = directs[_u];
+        uint256[] memory volumes = new uint256[](refs.length);
+        for (uint i = 0; i < refs.length; i++) { volumes[i] = directBusiness[_u][refs[i]]; }
+        return (refs, volumes);
+    }
+
+    receive() external payable {}
+}
 
