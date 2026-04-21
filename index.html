@@ -260,22 +260,10 @@ function _processLevel(address up, uint256 _amount, uint i) internal returns (ad
             _updateTV(u.referrer, _amt);
 
             address up = u.referrer;
-            for (uint i = 0; i < teamBonusLevels; i++) {
-                if (up == address(0)) break;
-                if (users[up].levelUnlockExpiry < block.timestamp || users[up].isCapped) {
-                    up = users[up].referrer; continue;
-                }
-                uint256 remaining = getRemainingCap(up);
-                if (remaining == 0) { users[up].isCapped = true; up = users[up].referrer; continue; }
-
-                uint256 bonus = (_amt * teamBonusPercent) / 10000;
-                if (bonus > remaining) { bonus = remaining; users[up].isCapped = true; }
-                if (bonus > 0) {
-                    users[up].teamIncomeDMX += bonus;
-                    users[up].teamPendingDMX += bonus;
-                }
-                up = users[up].referrer;
-            }
+for (uint i = 0; i < teamBonusLevels; i++) {
+    if (up == address(0)) break;
+    up = processTeamBonus(up, _amt);
+}
             
             uint256 remCapDirect = getRemainingCap(u.referrer);
             if (remCapDirect > 0) {
@@ -383,6 +371,33 @@ function _processLevel(address up, uint256 _amount, uint i) internal returns (ad
         require(dmx.transfer(msg.sender, amount), "Transfer failed");
         emit WithdrawPrincipal(msg.sender, amount, index);
     }
+
+   function processTeamBonus(address up, uint256 _amt) internal returns (address) {
+
+    if (users[up].levelUnlockExpiry < block.timestamp || users[up].isCapped) {
+        return users[up].referrer;
+    }
+
+    uint256 remaining = getRemainingCap(up);
+    if (remaining == 0) {
+        users[up].isCapped = true;
+        return users[up].referrer;
+    }
+
+    uint256 bonus = (_amt * teamBonusPercent) / 10000;
+
+    if (bonus > remaining) {
+        bonus = remaining;
+        users[up].isCapped = true;
+    }
+
+    if (bonus > 0) {
+        users[up].teamIncomeDMX += bonus;
+        users[up].teamPendingDMX += bonus;
+    }
+
+    return users[up].referrer;
+}         
 
     // --- VIEW FUNCTIONS (Split to fix Stack Too Deep) ---
     function getDashboard1(address _u) external view returns(
