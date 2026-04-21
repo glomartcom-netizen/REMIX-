@@ -182,31 +182,51 @@ contract DimeXFinalMaster is Pausable, Ownable, ReentrancyGuard {
     }
 
     function _distributeLevelAuto(address _user, uint256 _amount) internal {
-        address up = users[_user].referrer;
-        for (uint i = 0; i < 25; i++) {
-            if (up == address(0)) break;
-            if (users[up].levelUnlockExpiry < block.timestamp || users[up].isCapped) {
-                up = users[up].referrer; continue; 
-            }
-            if (unlockMode == 1 && levelDirectRequired[i+1] > 0 && directs[up].length < levelDirectRequired[i+1]) {
-                up = users[up].referrer; continue;
-            } else if (unlockMode == 2 && levelUnlockVolume[i+1] > 0 && users[up].teamVolumeDMX < levelUnlockVolume[i+1]) {
-                up = users[up].referrer; continue;
-            }
-            uint256 remaining = getRemainingCap(up);
-            if (remaining == 0) { users[up].isCapped = true; up = users[up].referrer; continue; }
+    address up = users[_user].referrer;
 
-            uint256 b = (_amount * levelBps[i]) / 10000;
-            if (b > remaining) { b = remaining; users[up].isCapped = true; }
-            if (b > 0) {
-                users[up].levelIncomeDMX += b;
-                users[up].claimableDMX += b;
-                levelIncomeBreakup[up][i] += b;
-                totalLevelPaid += b;
-            }
-            up = users[up].referrer;
-        }
+    for (uint i = 0; i < 25; i++) {
+        if (up == address(0)) break;
+
+        up = _processLevel(up, _amount, i);
     }
+}
+
+function _processLevel(address up, uint256 _amount, uint i) internal returns (address) {
+
+    if (users[up].levelUnlockExpiry < block.timestamp || users[up].isCapped) {
+        return users[up].referrer;
+    }
+
+    if (unlockMode == 1 && levelDirectRequired[i+1] > 0 && directs[up].length < levelDirectRequired[i+1]) {
+        return users[up].referrer;
+    }
+
+    if (unlockMode == 2 && levelUnlockVolume[i+1] > 0 && users[up].teamVolumeDMX < levelUnlockVolume[i+1]) {
+        return users[up].referrer;
+    }
+
+    uint256 remaining = getRemainingCap(up);
+    if (remaining == 0) {
+        users[up].isCapped = true;
+        return users[up].referrer;
+    }
+
+    uint256 b = (_amount * levelBps[i]) / 10000;
+
+    if (b > remaining) {
+        b = remaining;
+        users[up].isCapped = true;
+    }
+
+    if (b > 0) {
+        users[up].levelIncomeDMX += b;
+        users[up].claimableDMX += b;
+        levelIncomeBreakup[up][i] += b;
+        totalLevelPaid += b;
+    }
+
+    return users[up].referrer;
+}
 
     function stakeDMX(uint256 _amount, uint256 _duration, address _ref) external whenNotPaused nonReentrant {
         require(_amount >= MIN_STAKE_DMX, "Below Min");
